@@ -37,27 +37,39 @@ internal class Formatter {
 	}
 	
 	internal func work() throws {
-		let originalFileData = try loadData(from: projectFileUrl)
-		let jsonPlist: [String : Any] = try convertToJsonPlist(data: originalFileData)
+		let startingDate = Date()
+		defer {
+			let stoppingDate = Date()
+			let elapsedTime = stoppingDate.timeIntervalSince(startingDate)
+			
+			print("Elapsed time: \(elapsedTime).")
+		}
 		
+		let fileData = try loadData(from: projectFileUrl)
+		let jsonPlist: [String : Any] = try readAsJsonPlist(data: fileData)
+		
+		let objectIds: Set<String>
 		let pathUrlMap: [String : URL]
-		let idMap: [String : String]
-		(pathUrlMap, idMap) = try MapsBuilder(jsonPlist: jsonPlist).work()
+		let convertedIdMap: [String : String]
+		(objectIds, pathUrlMap, convertedIdMap) = try buildConversions(jsonPlist: jsonPlist)
 		
-		guard let originalFileContent = String(data: originalFileData, encoding: .utf8) else {
+		guard let fileContent = String(data: fileData, encoding: .utf8) else {
 			throw UnknownError()
 		}
-		let originalLines = originalFileContent.components(separatedBy: .newlines)
+		let fileLines = fileContent.components(separatedBy: .newlines)
 		
-		let formattedLines = try formatLines(
-			originalLines,
+		let (
+			formattedFileLines,
+			fileLinesAreModified
+		) = try formatFileLines(
+			fileLines,
+			objectIds: objectIds,
 			pathUrlMap: pathUrlMap,
-			idMap: idMap
+			convertedIdMap: convertedIdMap
 		)
-		let formattedFileContent = formattedLines.joined(separator: "\n")
-		
-		if formattedFileContent != originalFileContent {
-			try? formattedFileContent.write(to: projectFileUrl, atomically: true, encoding: .utf8)
+		if fileLinesAreModified {
+			let formattedFileContent = formattedFileLines.joined(separator: "\n")
+			try formattedFileContent.write(to: projectFileUrl, atomically: true, encoding: .utf8)
 		}
 	}
 }
@@ -77,7 +89,7 @@ fileprivate func loadData(from fileUrl: URL) throws -> Data {
 
 // MARK: -
 
-fileprivate func convertToJsonPlist(data: Data) throws -> [String : Any] {
+fileprivate func readAsJsonPlist(data: Data) throws -> [String : Any] {
 	let inputPipe = Pipe()
 	let outputPipe = Pipe()
 	
@@ -118,665 +130,738 @@ fileprivate func convertToJsonPlist(data: Data) throws -> [String : Any] {
 
 // MARK: -
 
-fileprivate class MapsBuilder {
-	private let jsonObjectMap: [String : [String : Any]]
-	
-	private let rootObjectId: String
-	
-	fileprivate init(jsonPlist: [String : Any]) throws {
-		guard let jsonObjectMap = jsonPlist["objects"] as? [String : [String : Any]] else {
-			throw UnknownError()
-		}
-		self.jsonObjectMap = jsonObjectMap
+fileprivate func buildConversions(jsonPlist: [String : Any]) throws -> (
+	objectIds: Set<String>,
+	pathUrlMap: [String : URL],
+	convertedIdMap: [String : String]
+) {
+	class Worker {
+		private let jsonObjectMap: [String : [String : Any]]
 		
-		guard let rootObjectId = jsonPlist["rootObject"] as? String else {
-			throw UnknownError()
-		}
-		self.rootObjectId = rootObjectId
-	}
-	
-	// Records node path URLs by their original IDs.
-	private var pathUrlMap: [String : URL] = [:]
-	
-	// Records converted node IDs by their original IDs.
-	private var idMap: [String : String] = [:]
-	
-	fileprivate func work() throws -> (
-		pathUrlMap: [String : URL],
-		idMap: [String : String]
-	) {
-		try walkThrough(objectId: rootObjectId, basePathUrl: URL(fileURLWithPath: "/"))
+		private let rootObjectId: String
 		
-		// Determination of paths of "PBXTargetDependency" nodes are delayed
-		// until now, as paths of "PBXContainerInfoProxy" nodes have been determined.
-		for (objectId, jsonObject) in jsonObjectMap {
+		fileprivate init(jsonPlist: [String : Any]) throws {
+			guard let jsonObjectMap = jsonPlist["objects"] as? [String : [String : Any]] else {
+				throw UnknownError()
+			}
+			self.jsonObjectMap = jsonObjectMap
+			
+			guard let rootObjectId = jsonPlist["rootObject"] as? String else {
+				throw UnknownError()
+			}
+			self.rootObjectId = rootObjectId
+		}
+		
+		private var objectIds: Set<String> = []
+		
+		private var pathUrlMap: [String : URL] = [:]
+		
+		private var convertedIdMap: [String : String] = [:]
+		
+		fileprivate func work() throws -> (
+			objectIds: Set<String>,
+			pathUrlMap: [String : URL],
+			convertedIdMap: [String : String]
+		) {
+			try walkThrough(objectId: rootObjectId, basePathUrl: URL(fileURLWithPath: "/"))
+			
+			// Determination of paths of "PBXTargetDependency" nodes are delayed
+			// until now, as paths of "PBXContainerInfoProxy" nodes have been determined.
+			for (objectId, jsonObject) in jsonObjectMap {
+				guard let isa = jsonObject["isa"] as? String else {
+					throw UnknownError()
+				}
+				
+				if isa == "PBXTargetDependency" {
+					guard
+						let id = jsonObject["targetProxy"] as? String,
+						let pathUrl = pathUrlMap[id]?.replacingScheme(with: nil)
+					else {
+						throw UnknownError()
+					}
+					
+					try record(isa: isa, pathUrl: pathUrl, originalId: objectId)
+				}
+			}
+			
+			// All objects should be iterated and recorded.
+			#if DEBUG
+			if Set(jsonObjectMap.keys) != objectIds {
+				throw UnknownError()
+			}
+			#endif
+			
+			// No two different IDs should share a same converted ID.
+			#if DEBUG
+			var reversedIdMap: [String : String] = [:]
+			for (key, value) in convertedIdMap {
+				if reversedIdMap.keys.contains(value) {
+					throw UnknownError()
+				}
+				
+				reversedIdMap[value] = key
+			}
+			#endif
+			
+			return (objectIds, pathUrlMap, convertedIdMap)
+		}
+		
+		private func walkThrough(objectId: String, basePathUrl: URL) throws {
+			guard let jsonObject = jsonObjectMap[objectId] else {
+				throw UnknownError()
+			}
+			
 			guard let isa = jsonObject["isa"] as? String else {
 				throw UnknownError()
 			}
 			
-			if isa == "PBXTargetDependency" {
-				guard
-					let id = jsonObject["targetProxy"] as? String,
-					let pathUrl = pathUrlMap[id]
+			switch isa {
+			case "PBXProject":
+				try walkThrough(jsonProject: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "PBXGroup", "PBXVariantGroup":
+				try walkThrough(jsonGroup: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "PBXFileReference":
+				try walkThrough(jsonFileReference: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "XCConfigurationList":
+				try walkThrough(jsonConfigurationList: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "XCBuildConfiguration":
+				try walkThrough(jsonBuildConfiguration: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "PBXNativeTarget":
+				try walkThrough(jsonTarget: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "PBXTargetDependency":
+				try walkThrough(jsonTargetDependency: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "PBXContainerItemProxy":
+				try walkThrough(jsonContainerItemProxy: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			case "PBXBuildFile":
+				try walkThrough(jsonBuildFile: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			
+			default:
+				if isa.hasPrefix("PBX") && isa.hasSuffix("BuildPhase") {
+					try walkThrough(jsonBuildPhase: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+				}
 				else {
 					throw UnknownError()
 				}
-				
-				record(isa: isa, pathUrl: pathUrl, originalId: objectId)
 			}
 		}
 		
-		#if DEBUG
-		var reversedIdMap: [String : String] = [:]
-		
-		for (key, value) in idMap {
-			if reversedIdMap[value] != nil {
-				fatalError()
-			}
+		private func walkThrough(jsonProject: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl = basePathUrl
 			
-			reversedIdMap[value] = key
-		}
-		#endif
-		
-		return (pathUrlMap, idMap)
-	}
-	
-	private func walkThrough(objectId: String, basePathUrl: URL) throws {
-		guard let jsonObject = jsonObjectMap[objectId] else {
-			throw UnknownError()
-		}
-		
-		guard let isa = jsonObject["isa"] as? String else {
-			throw UnknownError()
-		}
-		
-		switch isa {
-		case "PBXProject":
-			try walkThrough(jsonProject: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "PBXGroup", "PBXVariantGroup":
-			try walkThrough(jsonGroup: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "PBXFileReference":
-			try walkThrough(jsonFileReference: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "XCConfigurationList":
-			try walkThrough(jsonConfigurationList: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "XCBuildConfiguration":
-			try walkThrough(jsonBuildConfiguration: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "PBXNativeTarget":
-			try walkThrough(jsonTarget: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "PBXTargetDependency":
-			try walkThrough(jsonTargetDependency: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "PBXContainerItemProxy":
-			try walkThrough(jsonContainerItemProxy: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		case "PBXBuildFile":
-			try walkThrough(jsonBuildFile: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
-		
-		default:
-			if isa.hasPrefix("PBX") && isa.hasSuffix("BuildPhase") {
-				try walkThrough(jsonBuildPhase: jsonObject, isa: isa, originalId: objectId, basePathUrl: basePathUrl)
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+			
+			if let id = jsonProject["mainGroup"] as? String {
+				try walkThrough(objectId: id, basePathUrl: pathUrl)
 			}
 			else {
-				fatalError()
+				throw UnknownError()
 			}
-		}
-	}
-	
-	private func walkThrough(jsonProject: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl = basePathUrl
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-		
-		if let id = jsonProject["mainGroup"] as? String {
-			try walkThrough(objectId: id, basePathUrl: pathUrl)
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		if let ids = jsonProject["targets"] as? [String] {
-			for id in ids {
+			
+			if let ids = jsonProject["targets"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			if let id = jsonProject["buildConfigurationList"] as? String {
 				try walkThrough(objectId: id, basePathUrl: pathUrl)
 			}
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		if let id = jsonProject["buildConfigurationList"] as? String {
-			try walkThrough(objectId: id, basePathUrl: pathUrl)
-		}
-		else {
-			throw UnknownError()
-		}
-	}
-	
-	private func walkThrough(jsonGroup: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let name = jsonGroup["name"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent("|\(name)|")
-		}
-		else if let path = jsonGroup["path"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(path)
-		}
-		else {
-			pathUrl = basePathUrl
-		}
-		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-		
-		if let ids = jsonGroup["children"] as? [String] {
-			for id in ids {
-				try walkThrough(objectId: id, basePathUrl: pathUrl)
+			else {
+				throw UnknownError()
 			}
 		}
-		else {
-			throw UnknownError()
-		}
-	}
-	
-	private func walkThrough(jsonFileReference: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let name = jsonFileReference["name"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent("|\(name)|")
-		}
-		else if let path = jsonFileReference["path"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(path)
-		}
-		else {
-			throw UnknownError()
-		}
 		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-	}
-	
-	private func walkThrough(jsonConfigurationList: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl = basePathUrl
-		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-		
-		if let ids = jsonConfigurationList["buildConfigurations"] as? [String] {
-			for id in ids {
-				try walkThrough(objectId: id, basePathUrl: pathUrl)
+		private func walkThrough(jsonGroup: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let name = jsonGroup["name"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent("|\(name)|")
+			}
+			else if let path = jsonGroup["path"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(path)
+			}
+			else {
+				pathUrl = basePathUrl
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+			
+			if let ids = jsonGroup["children"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
 			}
 		}
-		else {
-			throw UnknownError()
-		}
-	}
-	
-	private func walkThrough(jsonBuildConfiguration: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let name = jsonBuildConfiguration["name"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(name)
-		}
-		else {
-			throw UnknownError()
+		
+		private func walkThrough(jsonFileReference: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let name = jsonFileReference["name"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent("|\(name)|")
+			}
+			else if let path = jsonFileReference["path"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(path)
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
 		}
 		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-	}
-	
-	private func walkThrough(jsonTarget: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let name = jsonTarget["name"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(name)
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-		
-		if let id = jsonTarget["buildConfigurationList"] as? String {
-			try walkThrough(objectId: id, basePathUrl: pathUrl)
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		if let ids = jsonTarget["buildPhases"] as? [String] {
-			for id in ids {
-				try walkThrough(objectId: id, basePathUrl: pathUrl)
+		private func walkThrough(jsonConfigurationList: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl = basePathUrl
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+			
+			if let ids = jsonConfigurationList["buildConfigurations"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
 			}
 		}
-		else {
-			throw UnknownError()
+		
+		private func walkThrough(jsonBuildConfiguration: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let name = jsonBuildConfiguration["name"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(name)
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
 		}
 		
-		if let ids = jsonTarget["dependencies"] as? [String] {
-			for id in ids {
+		private func walkThrough(jsonTarget: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let name = jsonTarget["name"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(name)
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+			
+			if let id = jsonTarget["buildConfigurationList"] as? String {
 				try walkThrough(objectId: id, basePathUrl: pathUrl)
 			}
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		if let ids = jsonTarget["buildRules"] as? [String] {
-			for id in ids {
-				try walkThrough(objectId: id, basePathUrl: pathUrl)
+			else {
+				throw UnknownError()
+			}
+			
+			if let ids = jsonTarget["buildPhases"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			if let ids = jsonTarget["dependencies"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			if let ids = jsonTarget["buildRules"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
 			}
 		}
-		else {
-			throw UnknownError()
-		}
-	}
-	
-	private func walkThrough(jsonBuildPhase: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let name = jsonBuildPhase["name"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent("|\(name)|")
-		}
-		else if let path = jsonBuildPhase["path"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(path)
-		}
-		else {
-			pathUrl = basePathUrl
-		}
 		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-		
-		if let ids = jsonBuildPhase["files"] as? [String] {
-			for id in ids {
-				try walkThrough(objectId: id, basePathUrl: pathUrl)
+		private func walkThrough(jsonBuildPhase: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let name = jsonBuildPhase["name"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent("|\(name)|")
+			}
+			else if let path = jsonBuildPhase["path"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(path)
+			}
+			else {
+				pathUrl = basePathUrl
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+			
+			if let ids = jsonBuildPhase["files"] as? [String] {
+				for id in ids {
+					try walkThrough(objectId: id, basePathUrl: pathUrl)
+				}
+			}
+			else {
+				throw UnknownError()
 			}
 		}
-		else {
-			throw UnknownError()
+		
+		private func walkThrough(jsonBuildFile: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let id = jsonBuildFile["fileRef"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(pathUrlMap[id]!.lastPathComponent)
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+		}
+		
+		private func walkThrough(jsonTargetDependency: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl = basePathUrl
+			
+			// Actual path for this node is not determined yet, so it's not going
+			// to be recorded now.
+			
+			if let id = jsonTargetDependency["targetProxy"] as? String {
+				try walkThrough(objectId: id, basePathUrl: pathUrl)
+			}
+			else {
+				throw UnknownError()
+			}
+		}
+		
+		private func walkThrough(jsonContainerItemProxy: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
+			let pathUrl: URL
+			if let name = jsonContainerItemProxy["remoteInfo"] as? String {
+				pathUrl = basePathUrl.appendingPathComponent(name)
+			}
+			else {
+				throw UnknownError()
+			}
+			
+			try record(isa: isa, pathUrl: pathUrl, originalId: originalId)
+		}
+		
+		private func record(isa: String, pathUrl: URL, originalId: String) throws {
+			// An ID should not be touched more than once.
+			#if DEBUG
+			if objectIds.contains(originalId) {
+				throw UnknownError()
+			}
+			#endif
+			
+			objectIds.insert(originalId)
+			
+			pathUrlMap[originalId] = pathUrl.replacingScheme(with: isa)
+			
+			let convertedId = "\(isa)://\(pathUrl.path)".md5
+			if convertedId != originalId {
+				convertedIdMap[originalId] = convertedId
+			}
 		}
 	}
 	
-	private func walkThrough(jsonBuildFile: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let id = jsonBuildFile["fileRef"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(pathUrlMap[id]!.lastPathComponent)
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-	}
-	
-	private func walkThrough(jsonTargetDependency: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl = basePathUrl
-		
-		// Actual path for this node is not determined yet, so it's not going
-		// to be recorded now.
-		
-		if let id = jsonTargetDependency["targetProxy"] as? String {
-			try walkThrough(objectId: id, basePathUrl: pathUrl)
-		}
-		else {
-			throw UnknownError()
-		}
-	}
-	
-	private func walkThrough(jsonContainerItemProxy: [String : Any], isa: String, originalId: String, basePathUrl: URL) throws {
-		let pathUrl: URL
-		if let name = jsonContainerItemProxy["remoteInfo"] as? String {
-			pathUrl = basePathUrl.appendingPathComponent(name)
-		}
-		else {
-			throw UnknownError()
-		}
-		
-		record(isa: isa, pathUrl: pathUrl, originalId: originalId)
-	}
-	
-	private func record(isa: String, pathUrl: URL, originalId: String) {
-		#if DEBUG
-		if pathUrlMap[originalId] != nil {
-			fatalError()
-		}
-	
-		if idMap[originalId] != nil {
-			fatalError()
-		}
-		#endif
-		
-		pathUrlMap[originalId] = pathUrl.replacingScheme(with: isa)
-		
-		idMap[originalId] = "\(isa)://\(pathUrl.path)".md5
-	}
+	return try Worker(jsonPlist: jsonPlist).work()
 }
 
 // MARK: -
 
-fileprivate func formatLines(_ lines: [String], pathUrlMap: [String : URL], idMap: [String : String]) throws -> [String] {
-	var formattedLines: [String] = []
-	
-	var shouldTreatPendingGroupAsMap: Bool = false
-	var pendingGroup: (innerIndents: String, innerLines: [String])!
-	
-	for line in lines {
-		if pendingGroup == nil {
-			let formattedLine = try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-			formattedLines.append(formattedLine)
-			
-			if line.hasSuffix("{") {
-				// Opening a group of a map.
-				
-				let indents = String(line.prefix { $0 == "\t" })
-				let innerIndents = indents + "\t"
-				
-				shouldTreatPendingGroupAsMap = true
-				pendingGroup = (innerIndents: innerIndents, innerLines: [])
-			}
-			else if line.hasSuffix("(") {
-				// Opening a group of an array.
-				
-				let indents = String(line.prefix { $0 == "\t" })
-				let innerIndents = indents + "\t"
-				
-				shouldTreatPendingGroupAsMap = false
-				pendingGroup = (innerIndents: innerIndents, innerLines: [])
-			}
+fileprivate func formatFileLines(
+	_ lines: [String],
+	objectIds: Set<String>,
+	pathUrlMap: [String : URL],
+	convertedIdMap: [String : String]
+) throws -> ([String], Bool) {
+	class Worker {
+		private let lines: [String]
+		
+		private let objectIds: Set<String>
+		
+		private let pathUrlMap: [String : URL]
+		
+		private let convertedIdMap: [String : String]
+		
+		fileprivate init(
+			_ lines: [String],
+			objectIds: Set<String>,
+			pathUrlMap: [String : URL],
+			convertedIdMap: [String : String]
+		) throws {
+			self.lines = lines
+			self.objectIds = objectIds
+			self.pathUrlMap = pathUrlMap
+			self.convertedIdMap = convertedIdMap
 		}
-		else {
-			if line.hasPrefix(pendingGroup.innerIndents) {
-				// This is an inner line of the pending group.
-				
-				pendingGroup.innerLines.append(line)
-			}
-			else {
-				if shouldTreatPendingGroupAsMap {
-					formattedLines += (
-						try formatMapLines(pendingGroup.innerLines, pathUrlMap: pathUrlMap, idMap: idMap)
-					)
-					
-					if line.trimmingCharacters(in: .whitespaces).hasPrefix("}") {
-						// Closing the pending group.
+		
+		fileprivate func work() throws -> ([String], Bool) {
+			return try formatFileLines(lines)
+		}
+		
+		private let regexForSectionOpening = try! NSRegularExpression(pattern: "^\\/\\* Begin (\\w+) section \\*\\/$")
+		
+		private let regexForSectionClosing = try! NSRegularExpression(pattern: "^\\/\\* End (\\w+) section \\*\\/$")
+		
+		private func formatFileLines(_ lines: [String]) throws -> ([String], Bool) {
+			var formattedLines: [String] = []
+			var linesAreModified: Bool = false
+			
+			var pendingSection: (name: String, innerLines: [String])!
+			
+			for line in lines {
+				if pendingSection == nil {
+					if let result = regexForSectionOpening.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) {
+						// Opening a section.
 						
-						pendingGroup = nil
+						formattedLines.append(line)
+						
+						let rangeOfName = result.range(at: 1)
+						let name = (line as NSString).substring(with: rangeOfName)
+						
+						pendingSection = (name: name, innerLines: [])
 					}
 					else {
-						// Closing a section.
+						// This is a irrelevant line.
 						
-						pendingGroup.innerLines.removeAll()
+						let (formattedLine, lineIsModified) = try formatLine(line)
+						formattedLines.append(formattedLine)
+						if lineIsModified {
+							linesAreModified = true
+						}
 					}
 				}
 				else {
-					formattedLines += (
-						try formatArrayLines(pendingGroup.innerLines, pathUrlMap: pathUrlMap, idMap: idMap)
-					)
-					
-					if line.trimmingCharacters(in: .whitespaces).hasPrefix(")") {
-						// Closing the pending group.
-						
-						pendingGroup = nil
-					}
-					else {
+					if let result = regexForSectionClosing.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) {
 						// Closing a section.
 						
-						pendingGroup.innerLines.removeAll()
+						#if DEBUG
+						let rangeOfName = result.range(at: 1)
+						let name = (line as NSString).substring(with: rangeOfName)
+						
+						guard name == pendingSection.name else {
+							throw UnknownError()
+						}
+						#endif
+						
+						let (formattedSectionLines, sectionLinesAreModified) = try formatSectionLines(pendingSection.innerLines)
+						formattedLines += formattedSectionLines
+						if sectionLinesAreModified {
+							linesAreModified = true
+						}
+						
+						pendingSection = nil
+						
+						formattedLines.append(line)
+					}
+					else {
+						// This is a section line.
+						
+						pendingSection.innerLines.append(line)
 					}
 				}
-				
-				formattedLines.append(
-					try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-				)
 			}
-		}
-	}
-	
-	guard pendingGroup == nil else {
-		// If there is still a pending group, the project file must have been malformed.
-		throw UnknownError()
-	}
-	
-	return formattedLines
-}
-
-fileprivate let regexForMapItemOpening = try! NSRegularExpression(pattern: "^(\\t*)(?:(\\w+)|\"([^\"]+)\")(?: \\/\\*.*\\*\\/)? =")
-
-fileprivate func formatMapLines(_ lines: [String], pathUrlMap: [String : URL], idMap: [String : String]) throws -> [String] {
-	var formattedLines: [String] = []
-	
-	/// Formatted lines of items, which are not added to `formattedLines` yet,
-	/// mapped against their original IDs.
-	var pendingFormattedItemLinesMap: [String : [String]] = [:]
-	
-	func flushPendingFormattedItemLinesMap() throws {
-		if pendingFormattedItemLinesMap.isEmpty {
-			return
+			
+			assert(formattedLines.count == lines.count)
+			assert(linesAreModified == (formattedLines != lines))
+			
+			return (formattedLines, linesAreModified)
 		}
 		
-		// Sort by converted IDs.
-		let sortedKeys = pendingFormattedItemLinesMap.keys.sorted {
-			return idMap[$0]! <= idMap[$1]!
+		private func formatSectionLines(_ sectionLines: [String]) throws -> ([String], Bool) {
+			// Treat section lines as map lines.
+			return try formatMapLines(sectionLines)
 		}
 		
-		for key in sortedKeys {
-			let formattedItemLines = pendingFormattedItemLinesMap[key]!
-			formattedLines += formattedItemLines
-		}
+		/// Regular expression for matching opening of a map item.
+		private let regexForMapItemOpening = try! NSRegularExpression(pattern: "^(\\t*)(?:(\\w+)|\"([^\"]+)\")(?: \\/\\*.*\\*\\/)? = ")
 		
-		pendingFormattedItemLinesMap.removeAll()
-	}
-	
-	/// Incomplete item.
-	var pendingItem: (originalId: String, openingLine: String, innerIndents: String, innerLines: [String])!
-	
-	for line in lines {
-		if pendingItem == nil {
-			try {
-				if let result = regexForMapItemOpening.firstMatch(in: line, range:NSRange(location: 0, length: (line as NSString).length)) {
-					var rangeForKey = result.range(at: 2)
-					if rangeForKey.location == NSNotFound {
-						rangeForKey = result.range(at: 3)
-					}
-					let key = (line as NSString).substring(with: rangeForKey)
-					
-					if key == "A7327C61C0D13B2C9DC8D63ED52589E7" {
-						_ = 0
-					}
-					
-					if pathUrlMap[key] != nil {
-						if line.hasSuffix("};") {
+		private func formatMapLines(_ lines: [String]) throws -> ([String], Bool) {
+			var formattedLines: [String] = []
+			var linesAreModified: Bool = false
+			
+			var pendingFormattedItemLines: [String] = []
+			var pendingFormattedItemKeys: [String] = []
+			var pendingFormattedItemLinesRangeMap: [String : Range<Int>] = [:]
+			
+			var pendingItem: (key: String, isMap: Bool, openingLine: String, innerIndents: String, innerLines: [String])!
+			
+			for line in lines {
+				if pendingItem == nil {
+					if let result = regexForMapItemOpening.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) {
+						var rangeForKey = result.range(at: 2)
+						if rangeForKey.location == NSNotFound {
+							rangeForKey = result.range(at: 3)
+						}
+						let key = (line as NSString).substring(with: rangeForKey)
+						
+						if line.hasSuffix(";") {
 							// This is a single-line item.
 							
-							let formattedLine = try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-							pendingFormattedItemLinesMap[key] = [formattedLine]
+							let (formattedLine, lineIsModified) = try formatLine(line)
+							
+							if lineIsModified {
+								linesAreModified = true
+							}
+							
+							if objectIds.contains(key) {
+								// The key is an object ID.
+								
+								let fromIndex = pendingFormattedItemLines.count
+								let toIndex = fromIndex + 1
+								
+								pendingFormattedItemLines.append(formattedLine)
+								pendingFormattedItemKeys.append(key)
+								pendingFormattedItemLinesRangeMap[key] = fromIndex ..< toIndex
+							}
+							else {
+								// The key is irrelevant.
+								
+								guard pendingFormattedItemLines.isEmpty else {
+									throw UnknownError()
+								}
+								
+								formattedLines.append(formattedLine)
+							}
 						}
 						else {
 							// This is a multi-line item.
 							
 							let rangeForIndents = result.range(at: 1)
 							let indents = (line as NSString).substring(with: rangeForIndents)
-							let innerIndents = indents + "\t"
 							
-							pendingItem = (originalId: key, openingLine: line, innerIndents: innerIndents, innerLines: [])
+							let isMap = line.hasSuffix("{")
+							
+							pendingItem = (key: key, isMap: isMap, openingLine: line, innerIndents: indents + "\t", innerLines: [])
+						}
+					}
+					else {
+						// This is an irrelevant line.
+						
+						guard pendingFormattedItemLines.isEmpty else {
+							throw UnknownError()
 						}
 						
-						return
-					}
-				}
-				
-				try flushPendingFormattedItemLinesMap()
-				
-				let formattedLine = try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-				formattedLines.append(formattedLine)
-			} ()
-		}
-		else {
-			if line.hasPrefix(pendingItem.innerIndents) {
-				// Continuing the pending item.
-				
-				pendingItem.innerLines.append(line)
-			}
-			else {
-				// Closing the pending item.
-				
-				var formattedItemLines: [String] = []
-				formattedItemLines.append(
-					try formatLine(pendingItem.openingLine, pathUrlMap: pathUrlMap, idMap: idMap)
-				)
-				formattedItemLines += (
-					try formatLines(pendingItem.innerLines, pathUrlMap: pathUrlMap, idMap: idMap)
-				)
-				formattedItemLines.append(
-					try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-				)
-				
-				pendingFormattedItemLinesMap[pendingItem.originalId] = formattedItemLines
-				
-				pendingItem = nil
-			}
-		}
-	}
-	
-	guard pendingItem == nil else {
-		// All items should be closed.
-		throw UnknownError()
-	}
-	
-	try flushPendingFormattedItemLinesMap()
-	
-	return formattedLines
-}
-
-fileprivate let regexForArrayItem = try! NSRegularExpression(pattern: "^\\t*(?:(\\w+)|\"([^\"]+)\")(?: \\/\\*.*\\*\\/)?,$")
-
-fileprivate let sortedIsas = [
-	"PBXGroup",
-]
-
-fileprivate func formatArrayLines(_ lines: [String], pathUrlMap: [String : URL], idMap: [String : String]) throws -> [String] {
-	var formattedLines: [String] = []
-	
-	/// Formatted lines of items, which are not added to `formattedLines` yet,
-	/// mapped against their original IDs.
-	var pendingFormattedItemLineMap: [String : String] = [:]
-	
-	func flushPendingFormattedItemLineMap() throws {
-		if pendingFormattedItemLineMap.isEmpty {
-			return
-		}
-		
-		// Sort by paths or IDs.
-		let sortedKeys = pendingFormattedItemLineMap.keys.sorted {
-			let url0 = pathUrlMap[$0]!
-			let url1 = pathUrlMap[$1]!
-			
-			let isa0 = url0.scheme!
-			let isa1 = url1.scheme!
-			if let index0 = sortedIsas.index(of: isa0) {
-				if let index1 = sortedIsas.index(of: isa1) {
-					if index0 < index1 {
-						return true
-					}
-					else if index0 > index1 {
-						return false
+						let (formattedLine, lineIsModified) = try formatLine(line)
+						formattedLines.append(formattedLine)
+						if lineIsModified {
+							linesAreModified = true
+						}
 					}
 				}
 				else {
+					if line.hasPrefix(pendingItem.innerIndents) {
+						// This is another line of the pending item.
+						
+						pendingItem.innerLines.append(line)
+					}
+					else {
+						// Closing the pending item.
+						
+						var formattedItemLines: [String] = []
+						
+						let (formattedOpeningLine, openingLineIsModified) = try formatLine(pendingItem.openingLine)
+						formattedItemLines.append(formattedOpeningLine)
+						if openingLineIsModified {
+							linesAreModified = true
+						}
+						
+						let (formattedInnerLines, innerLinesAreModified) = try (
+							pendingItem.isMap ?
+							formatMapLines(pendingItem.innerLines) :
+							formatArrayLines(pendingItem.innerLines)
+						)
+						formattedItemLines += formattedInnerLines
+						if innerLinesAreModified {
+							linesAreModified = true
+						}
+						
+						formattedItemLines.append(line)
+						
+						let key = pendingItem.key
+						if objectIds.contains(key) {
+							let fromIndex = pendingFormattedItemLines.count
+							let toIndex = fromIndex + formattedItemLines.count
+							
+							pendingFormattedItemLines += formattedItemLines
+							pendingFormattedItemKeys.append(key)
+							pendingFormattedItemLinesRangeMap[key] = fromIndex ..< toIndex
+						}
+						else {
+							formattedLines += formattedItemLines
+						}
+						
+						pendingItem = nil
+					}
+				}
+			}
+			
+			let keys = pendingFormattedItemKeys
+			let sortedKeys = keys.sorted {
+				// Sort by converted IDs.
+				
+				let convertedId0 = convertedIdMap[$0] ?? $0
+				let convertedId1 = convertedIdMap[$1] ?? $1
+				
+				return convertedId0 <= convertedId1
+			}
+			
+			if sortedKeys.elementsEqual(keys) {
+				formattedLines += pendingFormattedItemLines
+			}
+			else {
+				linesAreModified = true
+				
+				for key in sortedKeys {
+					let formattedItemLinesRange = pendingFormattedItemLinesRangeMap[key]!
+					let formattedItemlines = pendingFormattedItemLines[formattedItemLinesRange]
+					formattedLines += formattedItemlines
+				}
+			}
+			
+			assert(formattedLines.count == lines.count)
+			assert(linesAreModified == (formattedLines != lines))
+			
+			return (formattedLines, linesAreModified)
+		}
+		
+		/// Regular expression for matching an array item.
+		private let regexForArrayItem = try! NSRegularExpression(pattern: "^\\t*(?:(\\w+)|\"([^\"]+)\")(?: \\/\\*.*\\*\\/)?,$")
+		
+		private func formatArrayLines(_ lines: [String]) throws -> ([String], Bool) {
+			var formattedLines: [String] = []
+			var linesAreModified: Bool = false
+			
+			var pendingFormattedItemLines: [String] = []
+			var pendingFormattedItemKeys: [String] = []
+			var pendingFormattedItemLinesIndexMap: [String : Int] = [:]
+			
+			for line in lines {
+				if let result = regexForArrayItem.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) {
+					var rangeForKey = result.range(at: 1)
+					if rangeForKey.location == NSNotFound {
+						rangeForKey = result.range(at: 2)
+					}
+					let key = (line as NSString).substring(with: rangeForKey)
+					
+					let (formattedLine, lineIsModified) = try formatLine(line)
+					
+					if lineIsModified {
+						linesAreModified = true
+					}
+					
+					if objectIds.contains(key) {
+						// The key is an object ID.
+						
+						let index = pendingFormattedItemLines.count
+						
+						pendingFormattedItemLines.append(formattedLine)
+						pendingFormattedItemKeys.append(key)
+						pendingFormattedItemLinesIndexMap[key] = index
+					}
+					else {
+						// The key is irrelevant.
+						
+						guard pendingFormattedItemLines.isEmpty else {
+							throw UnknownError()
+						}
+						
+						formattedLines.append(formattedLine)
+					}
+				}
+				else {
+					// There should not be an irrelevant line.
+					throw UnknownError()
+				}
+			}
+			
+			let keys = pendingFormattedItemKeys
+			let sortedKeys = keys.sorted {
+				// Sort by paths then converted IDs.
+				
+				let path0 = pathUrlMap[$0]!.path
+				let path1 = pathUrlMap[$1]!.path
+				if path0 < path1 {
 					return true
 				}
-			}
-			else {
-				if sortedIsas.contains(isa1) {
+				else if path0 > path1 {
 					return false
 				}
-			}
-			
-			let path0 = url0.path
-			let path1 = url1.path
-			if path0 < path1 {
-				return true
-			}
-			else if path0 > path1 {
-				return false
-			}
-			
-			let convertedId0 = idMap[$0]!
-			let convertedId1 = idMap[$1]!
-			
-			return convertedId0 <= convertedId1
-		}
-		
-		for key in sortedKeys {
-			let formattedItemLine = pendingFormattedItemLineMap[key]!
-			formattedLines.append(formattedItemLine)
-		}
-		
-		pendingFormattedItemLineMap.removeAll()
-	}
-	
-	for line in lines {
-		try {
-			if let result = regexForArrayItem.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) {
-				var rangeForKey = result.range(at: 1)
-				if rangeForKey.location == NSNotFound {
-					rangeForKey = result.range(at: 2)
-				}
-				let key = (line as NSString).substring(with: rangeForKey)
 				
-				if pathUrlMap[key] != nil {
-					let formattedItemLine = try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-					pendingFormattedItemLineMap[key] = formattedItemLine
-					
-					return
+				let convertedId0 = convertedIdMap[$0] ?? $0
+				let convertedId1 = convertedIdMap[$1] ?? $1
+				
+				return convertedId0 < convertedId1
+			}
+			
+			if sortedKeys.elementsEqual(keys) {
+				formattedLines += pendingFormattedItemLines
+			}
+			else {
+				linesAreModified = true
+				
+				for key in sortedKeys {
+					let index = pendingFormattedItemLinesIndexMap[key]!
+					let formattedLine = pendingFormattedItemLines[index]
+					formattedLines.append(formattedLine)
 				}
 			}
 			
-			try flushPendingFormattedItemLineMap()
+			assert(formattedLines.count == lines.count)
+			assert(linesAreModified == (formattedLines != lines))
 			
-			let formattedLine = try formatLine(line, pathUrlMap: pathUrlMap, idMap: idMap)
-			formattedLines.append(formattedLine)
-		} ()
-	}
-	
-	try flushPendingFormattedItemLineMap()
-	
-	return formattedLines
-}
-
-let regexsForMatchingIds = [
-	try! NSRegularExpression(pattern: "(\\w+|\\\"[^\\\"]+\\\") \\/\\*"),
-	try! NSRegularExpression(pattern: "^\\t*(\\w+|\\\"[^\\\"]+\\\") = \\{"),
-	try! NSRegularExpression(pattern: "^\\t*(?:mainGroup|remoteGlobalIDString|TestTargetID) = (\\w+|\\\"[^\\\"]+\\\");$"),
-]
-
-fileprivate func formatLine(_ line: String, pathUrlMap: [String : URL], idMap: [String : String]) throws -> String {
-	var line = line
-	
-	for regex in regexsForMatchingIds {
-		let results = regex.matches(in: line, options: [], range: NSRange(location: 0, length: (line as NSString).length))
-		if results.isEmpty {
-			continue
+			return (formattedLines, linesAreModified)
 		}
 		
-		for result in results.reversed() {
-			let range = result.range(at: 1)
-			assert(range.location != NSNotFound)
+		let regexsForExtractingIds = [
+			try! NSRegularExpression(pattern: "(\\w+|\\\"[^\\\"]+\\\") \\/\\*"),
+			try! NSRegularExpression(pattern: "^\\t*(\\w+|\\\"[^\\\"]+\\\") = \\{"),
+			try! NSRegularExpression(pattern: "^\\t*(?:mainGroup|remoteGlobalIDString|TestTargetID) = (\\w+|\\\"[^\\\"]+\\\");$"),
+		]
+		
+		private func formatLine(_ line: String) throws -> (String, Bool) {
+			var formattedLine: String = line
+			var lineIsModified: Bool = false
 			
-			let captureGroup = (line as NSString).substring(with: range)
+			for regex in regexsForExtractingIds {
+				for result in regex.matches(in: formattedLine, range: NSRange(location: 0, length: (formattedLine as NSString).length)).reversed() {
+					let range = result.range(at: 1)
+					let captureGroup = (formattedLine as NSString).substring(with: range)
+					
+					let id: String
+					if captureGroup.hasPrefix("\"") {
+						assert(captureGroup.hasSuffix("\""))
+						
+						id = String(captureGroup.dropFirst().dropLast())
+					}
+					else {
+						id = captureGroup
+					}
+					
+					if let convertedId = convertedIdMap[id] {
+						formattedLine = (formattedLine as NSString).replacingCharacters(in: range, with: convertedId)
+						lineIsModified = true
+					}
+				}
+			}
 			
-			let originalId: String
-			if captureGroup.first! == "\"" && captureGroup.last! == "\"" {
-				originalId = String(captureGroup.dropFirst().dropLast())
-			}
-			else {
-				originalId = captureGroup
-			}
-			
-			if let convertedId = idMap[originalId] {
-				line = (line as NSString).replacingCharacters(in: range, with: "\(convertedId)")
-			}
-			else {
-				continue
-			}
+			return (formattedLine, lineIsModified)
 		}
 	}
 	
-	return line
+	return try Worker(lines, objectIds: objectIds, pathUrlMap: pathUrlMap, convertedIdMap: convertedIdMap).work()
 }
 
 // MARK: -

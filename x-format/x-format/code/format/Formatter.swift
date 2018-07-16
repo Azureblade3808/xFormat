@@ -825,10 +825,10 @@ fileprivate func formatFileLines(
 			return (formattedLines, linesAreModified)
 		}
 		
-		private let regexsForExtractingIds = [
-			try! NSRegularExpression(pattern: "(\\w+|\\\"[^\\\"]+\\\") \\/\\*"),
-			try! NSRegularExpression(pattern: "^\\t*(\\w+|\\\"[^\\\"]+\\\") = \\{"),
-			try! NSRegularExpression(pattern: "^\\t*(?:mainGroup|remoteGlobalIDString|TestTargetID) = (\\w+|\\\"[^\\\"]+\\\");$"),
+		let regexsForExtractingIds = [
+			try! NSRegularExpression(pattern: "\\s(\\w+) \\/"),
+			try! NSRegularExpression(pattern: "^\\s(\\w+) = \\{"),
+			try! NSRegularExpression(pattern: "^\\s(?:mainGroup|remoteGlobalIDString|TestTargetID) = (\\w+)"),
 		]
 		
 		private func formatLine(_ line: String) throws -> (String, Bool) {
@@ -837,21 +837,11 @@ fileprivate func formatFileLines(
 			
 			for regex in regexsForExtractingIds {
 				for result in regex.matches(in: formattedLine, range: NSRange(location: 0, length: (formattedLine as NSString).length)).reversed() {
-					let range = result.range(at: 1)
-					let captureGroup = (formattedLine as NSString).substring(with: range)
-					
-					let id: String
-					if captureGroup.hasPrefix("\"") {
-						assert(captureGroup.hasSuffix("\""))
-						
-						id = String(captureGroup.dropFirst().dropLast())
-					}
-					else {
-						id = captureGroup
-					}
+					let rangeForId = result.range(at: 1)
+					let id = (formattedLine as NSString).substring(with: rangeForId)
 					
 					if let convertedId = convertedIdMap[id] {
-						formattedLine = (formattedLine as NSString).replacingCharacters(in: range, with: convertedId)
+						formattedLine = (formattedLine as NSString).replacingCharacters(in: rangeForId, with: convertedId)
 						lineIsModified = true
 					}
 				}

@@ -825,7 +825,7 @@ fileprivate func formatFileLines(
 			return (formattedLines, linesAreModified)
 		}
 		
-		let regexsForExtractingIds = [
+		private let regexsForExtractingIds = [
 			try! NSRegularExpression(pattern: "(\\w+|\\\"[^\\\"]+\\\") \\/\\*"),
 			try! NSRegularExpression(pattern: "^\\t*(\\w+|\\\"[^\\\"]+\\\") = \\{"),
 			try! NSRegularExpression(pattern: "^\\t*(?:mainGroup|remoteGlobalIDString|TestTargetID) = (\\w+|\\\"[^\\\"]+\\\");$"),
